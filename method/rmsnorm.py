@@ -6,3 +6,5 @@ print(t)
 #创建一个全为一的张量
 t2 = torch.ones(3,4)
 print(t2)
+
+#second save
