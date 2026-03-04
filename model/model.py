@@ -70,3 +70,25 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+import torch
+import torch.nn as nn
+#msnorm
+
+#继承nn.Module类
+class RMSNorm(nn.Module):
+#__init__初始化
+    def __init__(self,dim:int,eps:float=1e-5):
+        #dim:int是输入张量的维度，eps:float是一个小的常数，用于防止除以零的情况。
+        #dim：是python中的类型提示，表示dim参数应该是一个整数。eps：也是类型提示，表示eps参数应该是一个浮点数。
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+#_norm
+    def _norm(self,x):
+        #keepdim=True保持维度不变，mean(-1)在最后一个维度上求平均值，pow(2)对每个元素进行平方运算，rsqrt开方求倒数。
+        return torch.rsqrt(x.pow(2).mean(-1,keepdim = True) + self.eps)
+#forward前向传播
+    def forward(self,x):
+        return self.weight * self._norm(x.float()).type_as(x)
