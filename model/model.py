@@ -77,6 +77,7 @@ class MokioMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+from typing import Optional, Tuple
 # msnorm
 
 
@@ -195,3 +196,113 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
     )
     return q_embed, k_embed
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+
+    if n_rep == 1:
+        return x
+
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+        # expand函数用于扩展张量的维度，reshape函数用于改变张量的形状。通过这两步操作，可以将输入张量x按照指定的方式重复n_rep次，并返回一个新的张量。
+    )
+
+
+class Attention(nn.Module):
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads = (
+            args.num_key_value_heads
+            if args.num_key_value_heads is None
+            else args.num_attention_heads
+        )
+        # num_key_value_heads是一个整数参数，表示键值头的数量。如果args.num_key_value_heads不为None，则使用args.num_key_value_heads的值；否则，使用args.num_attention_heads的值。这样可以确保键值头的数量与注意力头的数量一致，或者根据需要进行调整。
+
+        assert args.num_attention_heads % self.num_key_value_heads == 0, (
+            "num_attention_heads must be divisible by num_key_value_heads"
+        )
+        # asssert语句用于检查条件是否满足，如果条件不满足，则会抛出一个AssertionError异常，并显示指定的错误消息。在这里，它检查num_attention_heads是否能够被num_key_value_heads整除，如果不能整除，则会抛出异常并提示错误消息。
+
+        self.n_local_heads = args.num_attention_heads
+        self.num_key_value_heads = args.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.num_key_value_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        self.q_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads * self.head_dim, bias=False
+        )
+        self.k_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False
+        )
+        self.o_proj = nn.Linear(
+            args.num_attention_heads * self.head_dim, args.hidden_size, bias=False
+        )
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)  # 残差连接的dropout
+        self.dropout = args.dropout
+
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
+        # flash_attention是一个布尔参数，表示是否使用Flash Attention机制。Flash Attention是一种优化的注意力计算方法，可以提高计算效率和内存使用效率。如果torch.nn.functional中存在scaled_dot_product_attention函数，并且args.flash_attention为True，则self.flash将被设置为True，表示可以使用Flash Attention机制；否则，self.flash将被设置为False，表示不使用Flash Attention机制。
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        positon_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+
+        # 投影，计算qkv
+        bsz, seq_len = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # 把输入拆分成多个头，用view
+        q = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        k = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        v = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        # q和k，使用rope
+        cos, sin = positon_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
+        # 对于k和v，使用repeat（注意kv cache）
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+
+        past_kv = (xk, xv) if use_cache else None
+        # if else None表示如果use_cache为False，则past_kv将被设置为None。这意味着在这种情况下，不会返回任何缓存的键值对。反正则，如果use_cache为True，则past_kv将包含当前的键和值，以便在后续的前向传播中使用。
+
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            # [bsz,n_local_heads*head_dim,seq_len]
+            # [bsz,n_local_heads,seq_len,head_dim]
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
+        )
+        # 进行attention计算，q@k^T/sqrt(d)
+
+        if (
+            self.flash
+            and seq_len > 1
+            and (attention_mask is None or torch.all(attention_mask == 1))
+        ):
+            attn_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(bsz, 1, 1, -1)
+                .expand(bsz, self.n_local_heads, seq_len, -1)
+                .bool()
+            )
+
+    # 最后拼接头，输出投影，返回
