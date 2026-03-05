@@ -78,8 +78,9 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
-# msnorm
+from torch.nn import funcitonal as F
 
+# msnorm
 
 # 继承nn.Module类
 class RMSNorm(nn.Module):
@@ -268,10 +269,10 @@ class Attention(nn.Module):
         # 投影，计算qkv
         bsz, seq_len = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        # 把输入拆分成多个头，用view
-        q = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        k = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-        v = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        # 把输入拆分成多个头，用view,8个头
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
         # q和k，使用rope
         cos, sin = positon_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
@@ -304,5 +305,54 @@ class Attention(nn.Module):
                 .expand(bsz, self.n_local_heads, seq_len, -1)
                 .bool()
             )
+            output = F.scaled_dot_product_attention(
+                xq,xk,xv,attn_mask=attn_mask,dropout_p = self.dropout if self.training else 0.0,is_causal = True
+            )
+            """
+self.training: 这是一个开关。
+
+当你在训练模式（Training）时，它是 True。
+
+当你在测试/推理模式（Evaluation）时，它是 False。           
+if self.training == True:
+    dropout_p = self.dropout
+else:
+    dropout_p = 0.0
+参数拆解 (Parameter Breakdown)
+我们可以用“搜寻知识”的过程来类比这三个关键矩阵：
+xq (Query/查询): 你想知道什么（比如：问题“苹果是什么？”）。
+xk (Key/键): 库里所有资料的索引（比如：书架上的标签“水果”、“科技”）。
+xv (Value/值): 资料的具体内容（比如：关于苹果的详细描述）。
+其他参数：
+attn_mask: 掩码。告诉模型哪些地方不该看（比如填充的无效位）。
+dropout_p: 随机“关掉”一部分神经元，防止模型过度依赖某些特定特征（防止过拟合）。
+is_causal = True: 因果掩码。确保模型在预测下一个词时，不能偷看后面的答案。
+           """
+            
+            # 缩放点积注意力机制 (Scaled Dot-Product Attention)。
+        else:
+            #手敲的attention计算
+            scores = (xq@xk.transpose(-1,-1))/math.sqert(self.head_dim)
+            scores = scores + torch.triu(
+                torch.full((seq_len,seq_len),float('-inf'),device = scores.device),
+                #-inf表示负无穷，triu函数用于生成一个上三角矩阵，full函数用于创建一个指定形状的张量，并用指定的值填充。这里生成了一个大小为(seq_len, seq_len)的矩阵，并用负无穷填充。这个矩阵将被添加到scores中，以实现因果掩码的效果，确保模型在计算注意力分数时只能关注当前词之前的位置。
+                #后面会置为0，前面为-inf，保证了模型只能关注当前词之前的位置。
+                diagonal = 1
+            ).unsqueeze(0).unsqueeze(0)
+            # unsqueeze函数用于在指定位置插入一个新的维度。这里的uns
 
     # 最后拼接头，输出投影，返回
+
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores.float(),dim = -1).type_as
+            scores = self.attn_dropout(scores)
+            output = scores@xv
+        # [bsz, n_local_heads,seq_len,head_dim] -> [bsz,seq_len,n_local_heads*head_dim]
+        output = output.transpose(1,2).reshape(bsz,seq_len,-1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output,past_kv
+
