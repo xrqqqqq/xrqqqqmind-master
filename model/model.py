@@ -83,6 +83,7 @@ import math
 from .activation_function import ACT2FN
 # msnorm
 
+
 # 继承nn.Module类
 class RMSNorm(nn.Module):
     # __init__初始化
@@ -307,7 +308,12 @@ class Attention(nn.Module):
                 .bool()
             )
             output = F.scaled_dot_product_attention(
-                xq,xk,xv,attn_mask=attn_mask,dropout_p = self.dropout if self.training else 0.0,is_causal = True
+                xq,
+                xk,
+                xv,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
             )
             """
 self.training: 这是一个开关。
@@ -329,60 +335,105 @@ attn_mask: 掩码。告诉模型哪些地方不该看（比如填充的无效位
 dropout_p: 随机“关掉”一部分神经元，防止模型过度依赖某些特定特征（防止过拟合）。
 is_causal = True: 因果掩码。确保模型在预测下一个词时，不能偷看后面的答案。
            """
-            
+
             # 缩放点积注意力机制 (Scaled Dot-Product Attention)。
         else:
-            #手敲的attention计算
-            scores = (xq@xk.transpose(-1,-1))/math.sqert(self.head_dim)
+            # 手敲的attention计算
+            scores = (xq @ xk.transpose(-1, -1)) / math.sqert(self.head_dim)
             scores = scores + torch.triu(
-                torch.full((seq_len,seq_len),float('-inf'),device = scores.device),
-                #-inf表示负无穷，triu函数用于生成一个上三角矩阵，full函数用于创建一个指定形状的张量，并用指定的值填充。这里生成了一个大小为(seq_len, seq_len)的矩阵，并用负无穷填充。这个矩阵将被添加到scores中，以实现因果掩码的效果，确保模型在计算注意力分数时只能关注当前词之前的位置。
-                #后面会置为0，前面为-inf，保证了模型只能关注当前词之前的位置。
-                diagonal = 1
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                # -inf表示负无穷，triu函数用于生成一个上三角矩阵，full函数用于创建一个指定形状的张量，并用指定的值填充。这里生成了一个大小为(seq_len, seq_len)的矩阵，并用负无穷填充。这个矩阵将被添加到scores中，以实现因果掩码的效果，确保模型在计算注意力分数时只能关注当前词之前的位置。
+                # 后面会置为0，前面为-inf，保证了模型只能关注当前词之前的位置。
+                diagonal=1,
             ).unsqueeze(0).unsqueeze(0)
             # unsqueeze函数用于在指定位置插入一个新的维度。这里的uns
 
-    # 最后拼接头，输出投影，返回
+            # 最后拼接头，输出投影，返回
 
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
 
-            scores = F.softmax(scores.float(),dim = -1).type_as
+            scores = F.softmax(scores.float(), dim=-1).type_as
             scores = self.attn_dropout(scores)
-            output = scores@xv
+            output = scores @ xv
         # [bsz, n_local_heads,seq_len,head_dim] -> [bsz,seq_len,n_local_heads*head_dim]
-        output = output.transpose(1,2).reshape(bsz,seq_len,-1)
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
-        return output,past_kv
+        return output, past_kv
+
 
 class FeedForward(nn.Module):
     # 初始化
     # 升维
-    #降维
-    #门控
-    #dropout
-    #激活函数
-    def __init__(self, args : MokioMindConfig):
+    # 降维
+    # 门控
+    # dropout
+    # 激活函数
+    def __init__(self, args: MokioMindConfig):
         super().__init__()
-        #升维度
+        # 升维度
         # 计算模型前馈网络（FFN）中中间层的宽度，并进行内存对齐。
-        #intermediate_size是前馈网络中间层的宽度，如果在配置中没有指定，则根据hidden_size计算一个默认值，并进行内存对齐处理。
-        #同时也是升维维度大小
+        # intermediate_size是前馈网络中间层的宽度，如果在配置中没有指定，则根据hidden_size计算一个默认值，并进行内存对齐处理。
+        # 同时也是升维维度大小
         if args.intermediate_size is None:
-            intermediate_size = int(args.hidden_size*8/3)
+            intermediate_size = int(args.hidden_size * 8 / 3)
             # 比例缩放 (The 8/3 Ratio)
-            args.intermediate_size = 64*((intermediate_size+64-1)//64)
+            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
             # 内存对齐 (Memory Alignment)，64倍数
-        
-        self.up_proj = nn.Linear(args.hidden_size,args.intermediate_sizem,bias = False)
-        self.down_proj = nn.Linear(args.intermediate_size,args.hidden_size,bias = False)
-        self.gate_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias = False)#门控
-        self.dropout = nn.Dropout(args.dropout)
-        self.act_fn = ACT2FN[args.hidden_act] #激活函数
 
-    def forwrad(self,x):
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_sizem, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(
+            args.hidden_size, args.intermediate_size, bias=False
+        )  # 门控
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act]  # 激活函数
+
+    def forwrad(self, x):
         return self.dropout(
-            self.down_proj(self.act_fn(self.gate_proj(x))*self.up_proj(x))
-        )    
+            self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        )
+
+
+class MokioMindLayer(nn.Module):
+    # Transformer Layer k
+    def __init__(self, layer_id: int, config: MokioMindConfig):
+        super().__init__()
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.self_attn = Attention(config)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.mlp = FeedForward(config)
+
+    def forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        past_key_value=None,
+        use_cache=False,
+        attention_mask=None,
+    ):
+        # self attention
+        residual = hidden_states
+        hidden_states, present_key_value = self.self.attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask,
+        )
+        hidden_states = residual + hidden_states
+
+        # mlp
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        return hidden_states, present_key_value
