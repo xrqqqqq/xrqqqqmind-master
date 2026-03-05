@@ -397,7 +397,7 @@ class FeedForward(nn.Module):
         )
 
 
-class MokioMindLayer(nn.Module):
+class MokioMindBlock(nn.Module):
     # Transformer Layer k
     def __init__(self, layer_id: int, config: MokioMindConfig):
         super().__init__()
@@ -423,7 +423,7 @@ class MokioMindLayer(nn.Module):
     ):
         # self attention
         residual = hidden_states
-        hidden_states, present_key_value = self.self.attn(
+        hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states),
             position_embeddings,
             past_key_value,
@@ -437,3 +437,104 @@ class MokioMindLayer(nn.Module):
             self.post_attention_layernorm(hidden_states)
         )
         return hidden_states, present_key_value
+
+class MokioMindModel(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.vocab_size,self.num_hidden_layers=(
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        #vocab_size是词汇表的大小，hidden_size是每个词向量的维度。这个嵌入层将输入的词索引转换为对应的词向量表示。
+        # nn.Embedding是PyTorch中的一个类，用于创建一个嵌入层。它接受两个参数：vocab_size和hidden_size。vocab_size表示词汇表的大小，即模型可以处理的不同词汇的数量；hidden_size表示每个词向量的维度，即每个词被表示为一个hidden_size维的向量。通过这个嵌入层，输入的词索引将被转换为对应的词向量表示，这些词向量将作为模型后续层的输入。
+        self.dropout = nn.Dropout(config.dropout)
+
+        self.layers = nn.ModuleList(
+            [MokioMindBlock(i,config) for i in range(config.num_hidden_layers)]
+        )
+
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        #RopE预计算
+        freqs_cos,freqs_sin = precomputer_freqs_cis(
+            dim = config.hidden_size // config.num_attention_heads,
+            end = config.max_position_embeddings,
+            rope_base = config.rope_theta,
+            rope_scaling = config.rope_scaling,
+        )
+        """
+        指针数量、表盘的最大刻度、齿轮的转速，以及表盘是否需要为了长文本进行弹性拉伸。
+        单头维度 (Head Dimension)每个“经理”（注意力头）分到了多少根**“时钟指针”（维度）。这个值是通过将模型的隐藏层大小除以注意力头的数量来计算的。
+        最大位置嵌入 (Maximum Position Embeddings)表盘上最多能画多少个**“时间刻度”**。也就是你允许模型一口气读多少个字
+
+        旋转基础底数 (RoPE Base / Theta)这个参数决定了频率的计算方式，影响了位置编码的周期性。较大的值会导致频率更密集，适合处理长文本；较小的值则适合短文本。
+
+        旋转缩放因子 (RoPE Scaling Factor)代码就会动态地把刻度挤一挤，让模型不至于“看花眼”。
+        """
+
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        #register_buffer函数用于注册一个持久化的缓冲区，这个缓冲区不会被视为模型的参数，也不会在训练过程中更新。这里注册了两个缓冲区freqs_cos和freqs_sin，分别存储预计算的频率的余弦和正弦值。这些缓冲区将被保存在模型的状态字典中，并且在模型保存和加载时会被正确处理。
+
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+            use_cache: bool = False,
+            **kwargs,
+    ):
+        """
+        输入标识符 (Input Token IDs)
+        维度公式： 它的形状通常是二维矩阵 。(Batch Size)：批次大小（同时处理几句话）。 (Sequence Length)：序列长度（这句话有几个字）。
+        注意力掩码 (Attention Mask)
+        防止作弊 (Causal Mask)： 在预测第 3 个字时，必须把第 4、5 个字遮住（变成 $-\infty$），防止模型偷看未来。忽略空白 (Padding Mask)： 如果一句话只有 3 个字，另一句有 5 个字，为了凑齐矩阵，短句后面会补上“空白占位符”。掩码会告诉模型：“这些空白没有意义，开会时不要理它们”。
+
+        历史键值缓存 (Past Key-Values Cache)
+        KV Cache,保留特征
+
+        使用缓存开关 (Use Cache Flag)
+        当你训练 (Training) 模型时，这个开关是关闭的（False），因为训练时是一次性看完全文，不需要逐字缓存。
+        当你推理 (Inference / Chat) 与模型聊天时，这个开关会打开（True），告诉模型：“算完这个字后，把新的笔记存下来，等下一个字进来时再拿给我用”
+
+        关键字参数 (Keyword Arguments) 防止程序因为不认识多余的参数而报错
+        """
+        batch_size,seq_len = input_ids.shape
+
+        if hasattr(past_key_values,"layers"):
+            past_key_values=None
+        # hasattr 就是用来检查有没有这个按钮的，如果有就用它，没有就算了。这里检查past_key_values是否有属性"layers"，如果有，就把past_key_values设置为None。这可能是为了兼容不同版本的输入格式，确保后续代码能够正确处理past_key_values。
+
+        past_key_values = past_key_values or [None] * len(self.layers)
+        # or（或者）： Python 的魔法逻辑。如果左边有东西（比如正在连续对话），就直接用左边的；如果左边是空的（None），就立刻执行右边的动作。
+        # [None] * len(self.layers)（右边）：[None, None, None, ..., None]
+
+        start_pos= (
+            past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        )
+        # [批次大小, 历史字数, 头数, 维度]。索引 [1] 拿到的正好是第二个维度——也就是历史字数
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos : start_pos + seq_len],
+            self.freqs_sin[start_pos : start_pos + seq_len],
+        )
+
+        presents=[]
+
+        for layer_idx,(layer,past_key_values) in enumerate(zip(self.layers,past_key_values)):
+            hidden_states,present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_values,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            # presents是一个列表（List），用于收集并保存大模型在当前计算步骤中，每一层 Transformer 计算出的最新键（Key）和值（Value）缓存
+            presents.append(present)
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states,presents
