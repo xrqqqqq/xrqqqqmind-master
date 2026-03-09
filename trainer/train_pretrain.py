@@ -15,7 +15,7 @@ from torch import optim  # 优化器
 from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
 from torch.utils.data import DataLoader, DistributedSampler  # 数据加载器
 
-from model.MokioModel import MokioMindConfig
+from model.model import MokioMindConfig
 from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import (  # 训练工具函数
     get_lr,
@@ -36,14 +36,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()  # 记录开始时间
 
     # 遍历数据批次
-    for step, (input_ids, labels, attention_mask) in enumerate(
-        loader, start=start_step + 1
-    ):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
-        attention_mask = attention_mask.to(
-            args.device
-        )  # ！修正：接收并转移 attention_mask
+    for step, batch in enumerate(loader, start=start_step + 1):
+        input_ids = batch["input_ids"].to(args.device)
+        labels = batch["labels"].to(args.device)
+        attention_mask = batch["attention_mask"].to(args.device)
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
 
@@ -63,7 +59,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
-        
+
         if step % args.accumulation_steps == 0:
             # scaler.unscale_(): 还原梯度的真实值
             scaler.unscale_(optimizer)
@@ -184,7 +180,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
+        default="dataset/pretrain_hq.jsonl",  # ！修正：原"dataset/..."缺少../前缀
         help="预训练数据路径",
     )
     parser.add_argument(

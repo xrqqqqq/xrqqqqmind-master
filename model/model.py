@@ -76,7 +76,7 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple, List, Union
-from torch.nn import funcitonal as F
+from torch.nn import functional as F
 import math
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
@@ -178,22 +178,22 @@ def precomputer_freqs_cis(
             # 当ramp = 1（低频）：系数为1/factor，频率缩小factor倍
             # 当0 < ramp < 1（过渡区域）：系数在1和1/factor之间线性变化，逐渐缩小频率
             freqs = freqs * (1 - ramp + ramp / factor)
-        # 根据end，生成位置索引t
-        t = torch.arange(end, device=freqs.device).float()
+    # 根据end，生成位置索引t
+    t = torch.arange(end, device=freqs.device).float()
 
-        # 计算外积，将t和freq相乘，得到每个位置的旋转角度
-        # t是温度，freqs是频率，外积得到每个位置的旋转角度。
-        freqs = torch.outer(t, freqs)
+    # 计算外积，将t和freq相乘，得到每个位置的旋转角度
+    # t是温度，freqs是频率，外积得到每个位置的旋转角度。
+    freqs = torch.outer(t, freqs)
 
-        # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
-        freqs_cos = (
-            torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-        )
-        freqs_sin = (
-            torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
-        )
+    # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
+    freqs_cos = (
+        torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    )
+    freqs_sin = (
+        torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    )
 
-        return freqs_cos, freqs_sin
+    return freqs_cos, freqs_sin
 
 
 # 编写RoPE
@@ -286,7 +286,7 @@ class Attention(nn.Module):
     ):
 
         # 投影，计算qkv
-        bsz, seq_len = x.shape
+        bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         # 把输入拆分成多个头，用view,8个头
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
@@ -501,7 +501,7 @@ class MokioMindModel(nn.Module):
         输入标识符 (Input Token IDs)
         维度公式： 它的形状通常是二维矩阵 。(Batch Size)：批次大小（同时处理几句话）。 (Sequence Length)：序列长度（这句话有几个字）。
         注意力掩码 (Attention Mask)
-        防止作弊 (Causal Mask)： 在预测第 3 个字时，必须把第 4、5 个字遮住（变成 $-\infty$），防止模型偷看未来。忽略空白 (Padding Mask)： 如果一句话只有 3 个字，另一句有 5 个字，为了凑齐矩阵，短句后面会补上“空白占位符”。掩码会告诉模型：“这些空白没有意义，开会时不要理它们”。
+        防止作弊 (Causal Mask)： 在预测第 3 个字时，必须把第 4、5 个字遮住（变成 -inf），防止模型偷看未来。忽略空白 (Padding Mask)： 如果一句话只有 3 个字，另一句有 5 个字，为了凑齐矩阵，短句后面会补上“空白占位符”。掩码会告诉模型：“这些空白没有意义，开会时不要理它们”。
 
         历史键值缓存 (Past Key-Values Cache)
         KV Cache,保留特征
@@ -551,7 +551,7 @@ class MokioMindModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        return hidden_states, presents
+        return hidden_states, presents, 0.0
 
 
 class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
