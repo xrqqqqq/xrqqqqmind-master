@@ -75,6 +75,7 @@ class MokioMindConfig(PretrainedConfig):
 
 import torch
 import torch.nn as nn
+from torch.nn import init
 from typing import Optional, Tuple, List, Union
 from torch.nn import functional as F
 import math
@@ -404,6 +405,120 @@ class FeedForward(nn.Module):
     def forward(self, x):
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         return self.dropout(self.down_proj(gated))
+
+
+class MoEGate(nn.Module):
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.config = config
+        # 每个词符激活的专家数量
+        self.top_k = config.num_experts_per_tok
+        # 路由专家总数Number of Routed Experts
+        self.n_routed_experts = config.n_routed_experts
+        #打分函数选择
+        self.scoring_func = config.scoring_func
+        # alpha用于控制辅助损失函数aux_loss，辅助损失系数
+        self.alpha = config.aux_loss_alpha
+        #seq_aux决定我们是使用句子级别还是系列级别的aux_loss计算方式
+        self.seq_aux = config.seq_aux
+
+        # 归一化 Top-K 概率，Normalize Top-K Probabilities
+        self.norm_topk_prob = config.norm_topk_prob
+        # 门控的“大脑”：权重矩阵 (Gate Weight)
+        # 门控输入维度，输入的词带有的特征数量。
+        self.gating_dim = config.hidden_size
+        # 门控权重矩阵
+        # 这是队长脑子里的**“能力评估手册”**！它是一个尺寸为 [4, 512] 的矩阵。输入的词汇特征（512维）跟这个手册一乘，直接就能得出 4 个专家对这个词的初始能力打分（Logits）。
+        self.weight = nn.Parameter(
+            torch.empty((self.n_routed_experts, self.gating_dim))
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        #kaiming初始化
+        #resnet的提出者
+        #初始化方法是方便的初始化一些合适的参数，跟好的训练网络
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, hidden_states):
+        #moe的时候，只看每个token值，不关心其位置，所以我们可以合并batch和seq_len维度
+        # 词与词之间必须按顺序排好（保留 seq_len）
+        # 但在 MoE 层，上下文信息的交互已经结束了
+        bsz, seq_len, h = hidden_states.shape
+        hidden_states = hidden_states.view(-1, h)
+        #linear映射计算出每个token对于各个expert的打分logits，维度是[bsz*seq_len, n_routed_experts]，每个token对应4个专家的打分
+        logits = F.linear(hidden_states, self.weight, None)
+        #softmax进行打分归一化
+        if self.scoring_func == "softmax":
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(
+                f"insupportable scoring function for MoE gating: {self.scoring_func}"
+            )
+
+        topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+
+        #权重归一化,
+        #目的，确保每个token对多个专家的权重和为1，避免权重累计过大
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        #计算辅助损失（仅训练时）
+        #目的，防止少数专过度内卷
+        
+        if self.training and self.alpha > 0.0:
+            scores_for_aux = scores #保存原始分数用于aux_loss计算
+            aux_topk = self.top_k
+            #恢复原始的batch和seq_len维度，方便后续计算
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+
+            #序列级别的损失seq_aux = True
+            if self.seq_aux:
+                #恢复scores维度：[bsz*seq_len]
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                #统计每个batch中每个专家被选中的次数
+                #dvice是为了设备对齐，在一个GPU上算矩阵
+                #ce : [bsz,n_routed_experts]，每个batch中每个专家被选中的次数
+                ce = torch.zeros(
+                    bsz, self.n_routed_experts, device=hidden_states.device
+                )
+                # scatter_add_函数根据topk_idx_for_aux_loss中的索引，将对应位置的值加到ce张量中。这里的值是一个全1的张量，表示每次被选中的专家计数加1。最终得到的ce张量中，每个元素表示对应专家在整个序列中被选中的总次数。
+                #div计算每个专家的平均使用率
+                # N *fi :  实际干活比例 $\times$ 专家总数
+                # /seq_len * aux_topk得到fi*pi
+                # *N ->fi*N
+                ce.scatter_add_(
+                    1,
+                    topk_idx_for_aux_loss,
+                    torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
+                ).div_(seq_len * aux_topk / self.n_routed_experts)
+                #计算辅助损失，ce是每个专家的平均使用率，scores_for_seq_aux.mean(dim=1)是每个专家的平均分数，乘积后求和得到总的aux_loss，再乘以alpha进行缩放。
+                #[bsz,n_experts] * [bsz,n_experts] -> [bsz]
+
+                # scores_for_seq_aux.mean(dim=1),计算 P_i。把一整句话（dim=1 代表序列长度 seq_len）里，门控网络对每个专家打出的概率求平均。
+                #loss = N*fi*pi
+                # $$[bsz, seq\_len, n\_routed\_experts]$$
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
+                    dim=1
+                ).mean() * self.alpha
+            else:
+            #批级别辅助损失
+                #view(-1)变成一位，插入到长度为n_routed_experts的维度上，进行one-hot编码，得到每个token对应的专家选择情况
+                mask_ce = F.one_hot(
+                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
+                )
+                #ce[n_routed_experts]，整个batch中每个专家被选中的平均选择次数
+                ce = mask_ce.float().mean(0)
+                #pi：【n_routed_experts】，表示batch中每个专家的平均期望分数
+                Pi = scores_for_aux.mean(0)
+                #fi：标准化专家选择率
+                fi = ce * self.n_routed_experts
+                #pi*fi约接近1，表示专家的实际选择率接近其期望分数。乘积求和得到总的aux_loss，再乘以alpha进行缩放。
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = scores.new_zeros(1).squeeze()
+        return topk_idx, topk_weight, aux_loss
 
 
 class MokioMindBlock(nn.Module):

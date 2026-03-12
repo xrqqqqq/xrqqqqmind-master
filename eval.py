@@ -9,8 +9,9 @@ from trainer.trainer_utils import setup_seed
 
 warnings.filterwarnings("ignore")
 
+
 # python eval.py --weight full_sft
-#启动评测脚本，默认加载 full_sft 权重（可选 pretrain, reason, ppo_actor, grpo, spo），并进入交互式对话模式。输入 0 选择预设测试问题，输入 1 则可以手动输入问题进行测试。模型会根据输入生成回答，并显示在控制台上。
+# 启动评测脚本，默认加载 full_sft 权重（可选 pretrain, reason, ppo_actor, grpo, spo），并进入交互式对话模式。输入 0 选择预设测试问题，输入 1 则可以手动输入问题进行测试。模型会根据输入生成回答，并显示在控制台上。
 def init_model(args):
     tokenizer = AutoTokenizer.from_pretrained(args.load_from)
     if "model" in args.load_from:
@@ -33,6 +34,7 @@ def init_model(args):
     )
     return model.eval().to(args.device), tokenizer
 
+
 def main():
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
     parser.add_argument(
@@ -44,7 +46,7 @@ def main():
     parser.add_argument("--save_dir", default="out", type=str, help="模型权重目录")
     parser.add_argument(
         "--weight",
-        default="pretrain",
+        default="full_sft",
         type=str,
         help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）",
     )
