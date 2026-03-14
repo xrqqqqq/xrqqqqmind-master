@@ -53,7 +53,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             )  # ！修正：直接传入labels和attention_mask，由模型内部计算loss
 
             loss = (
-                res.loss + res.aux_loss#moeloss->aux_loss
+                res.loss + res.aux_loss  # moeloss->aux_loss
             )  # ！修正：原手动计算loss_fct+loss_mask，现用模型内置的loss
 
             loss = loss / args.accumulation_steps
@@ -64,7 +64,9 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # scaler.unscale_(): 还原梯度的真实值
             scaler.unscale_(optimizer)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)#梯度剪切，防止梯度爆炸，保持训练稳定
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), args.grad_clip
+            )  # 梯度剪切，防止梯度爆炸，保持训练稳定
 
             # 📚 优化器更新知识点
             # scaler.step(): 执行参数更新
@@ -170,6 +172,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_moe",
+        # python trainer\train_pretrain.py --use_moe=1
         default=0,
         type=int,
         choices=[0, 1],

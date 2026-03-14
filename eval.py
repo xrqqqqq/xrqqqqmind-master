@@ -9,7 +9,9 @@ from trainer.trainer_utils import setup_seed
 
 warnings.filterwarnings("ignore")
 
-
+#
+# python trainer\train_pretrain.py --save_dir out --save_weight full_sft --hidden_size 512 --num_hidden_layers 8 --use_moe 1 --from_weight none --data_path dataset\pretrain_hq.jsonl
+#
 # python eval.py --weight full_sft
 # 启动评测脚本，默认加载 full_sft 权重（可选 pretrain, reason, ppo_actor, grpo, spo），并进入交互式对话模式。输入 0 选择预设测试问题，输入 1 则可以手动输入问题进行测试。模型会根据输入生成回答，并显示在控制台上。
 def init_model(args):
@@ -74,6 +76,7 @@ def main():
         type=int,
         choices=[0, 1],
         help="是否使用MoE架构（0=否，1=是）",
+        # python eval.py --use_moe=1
     )
     parser.add_argument(
         "--inference_rope_scaling",

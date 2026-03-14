@@ -1,3 +1,4 @@
+from typing import Optional
 from transformers import PretrainedConfig
 
 
@@ -24,6 +25,8 @@ class MokioMindConfig(PretrainedConfig):
         flash_attention: bool = True,
         ############ MoE ############
         use_moe: bool = False,
+        moe: Optional[bool] = None,
+        # 每个词符激活的专家数量 (Number of Experts Per Token / Top-K Routing)
         num_experts_per_tok: int = 2,
         n_routed_experts: int = 4,
         n_shared_experts: int = 1,
@@ -50,7 +53,9 @@ class MokioMindConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
         self.flash_attention = flash_attention
-        self.use_moe = use_moe
+        # Keep both names for backward compatibility across scripts/checkpoints.
+        self.use_moe = bool(use_moe if moe is None else moe)
+        self.moe = self.use_moe
         self.num_experts_per_tok = num_experts_per_tok
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
@@ -520,7 +525,104 @@ class MoEGate(nn.Module):
             aux_loss = scores.new_zeros(1).squeeze()
         return topk_idx, topk_weight, aux_loss
 
+class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
+    def __init__(self, config: MokioMindConfig):
+        super().__init__()
+        self.config = config
+        # 专门专家层，routed experts，MoE层的核心，提供多样化的处理能力
+        self.experts = nn.ModuleList(
+            [FeedForward(config) for _ in range(config.n_routed_experts)]
+        )
+        # 门控层
+        self.gate = MoEGate(config)
 
+        # 共享专家层，shared experts，提供通用的处理能力，增强模型的稳定性和泛化能力
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList(
+                [FeedForward(config) for _ in range(config.n_shared_experts)]
+            )
+
+    def forward(self, x):
+        #复制输入，以便后续共享专家使用，保持原始输入不变
+        identity = x
+        orig_shape = x.shape
+        bsz, seq_len, h = orig_shape
+
+        # 使用门控机制选择专家
+        topk_idx, topk_weight, aux_loss = self.gate(x)
+        # 展开x以便处理
+        x = x.view(-1, x.shape[-1])
+
+        flat_topk_idx = topk_idx.view(-1)
+        if self.training:
+            # 按照定义的num_experts_per_tok重复输入token
+            # 每个token安排num_experts_per_tok个专家处理
+            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # y是空张量，和x形状相同
+            y = torch.empty_like(x, dtype=x.dtype)
+            # 遍历所有专家
+            for i, expert in enumerate(self.experts):
+                # 找到所有指向专家i的token
+                # 然后将这些token输入专家i进行处理
+                # 最后将结果放回y对应位置
+                expert_out = expert(x[flat_topk_idx == i])
+                if expert_out.shape[0] > 0:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype)
+                else:
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(
+                        p.sum() for p in expert.parameters()
+                    )
+            # 加权求和
+            # 最后的y意义是每个token经过专家处理后的加权结果
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*orig_shape)
+        # 如果是推理阶段
+        else:
+            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
+                *orig_shape
+            )
+        if self.config.n_shared_experts > 0: 
+            for expert in self.shared_experts:
+                y = y + expert(identity)
+        self.aux_loss = aux_loss
+        return y
+
+    @torch.no_grad()
+    # MoE推理方法
+    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # 使用cache，创建一个和x形状相同的零张量
+        expert_cache = torch.zeros_like(x)
+        # 对专家索引进行排序，最后是[0,0,0,1,1,2,2,2,...]这样的顺序
+        # 分拣
+        idxs = flat_expert_indices.argsort()
+        # 统计每个专家被分配到的token数量
+        # 打包
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # 计算每个token对应的专家索引
+        token_idxs = idxs // self.config.num_experts_per_tok
+        # 对每个打包好的包进行处理
+        for i, end_idx in enumerate(tokens_per_expert):
+            # 计算当前包的起始位置
+            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            if start_idx == end_idx:
+                continue
+            # 取出当前包对应的专家
+            expert = self.experts[i]
+            # 取出token对应的原始id
+            exp_token_idx = token_idxs[start_idx:end_idx]
+            # 取出token对应的数据
+            expert_tokens = x[exp_token_idx]
+            # 计算专家输出，一次性处理当前包的所有token
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)
+            # 加权
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 将结果散点加到缓存中对应位置
+            expert_cache.scatter_add_(
+                0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
+            )
+
+        return expert_cache
+    
 class MokioMindBlock(nn.Module):
     # Transformer Layer k
     def __init__(self, layer_id: int, config: MokioMindConfig):
@@ -535,7 +637,8 @@ class MokioMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = FeedForward(config)
+        use_moe = getattr(config, "use_moe", getattr(config, "moe", False))
+        self.mlp = FeedForward(config) if not use_moe else MoEFeedForward(config)
 
     def forward(
         self,
