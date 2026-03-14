@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+# model/checkpoint
+out/*.pth
+
+# dataset files
+dataset/*.jsonl
